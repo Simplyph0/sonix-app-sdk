@@ -625,6 +625,60 @@ static void draw_pad(void) {
 
 }
 
+/* The frame counter: tap the picture to show it or hide it. It is kept as a file in the saves
+ * folder (Saves/<system>/.fps), so it stays as it was left. */
+static bool show_fps;
+static int fps_tenths; /* frames per second, times ten */
+static int fps_frames;
+static uint64_t fps_stamp;
+
+static void fps_path(char *out, size_t size) { snprintf(out, size, "%s/.fps", save_dir); }
+
+static void fps_load(void) {
+	char path[640];
+	fps_path(path, sizeof(path));
+	show_fps = access(path, F_OK) == 0;
+}
+
+static void fps_store(void) {
+	char path[640];
+	fps_path(path, sizeof(path));
+	if (show_fps) {
+		FILE *f = fopen(path, "w");
+		if (f) {
+			fputs("shown\n", f);
+			fclose(f);
+		}
+	} else {
+		remove(path);
+	}
+}
+
+/* Counts a frame, and every thirty works out what they came to in the time they took. */
+static void fps_count(void) {
+	uint64_t now = sonix_time_us();
+	if (fps_stamp == 0) {
+		fps_stamp = now;
+		return;
+	}
+	if (++fps_frames >= 30) {
+		fps_tenths = (int)((uint64_t)fps_frames * 10000000ull / (now - fps_stamp));
+		fps_frames = 0;
+		fps_stamp = now;
+	}
+}
+
+static void draw_fps(void) {
+	if (!show_fps || fps_tenths == 0) {
+		return;
+	}
+	char text[32];
+	snprintf(text, sizeof(text), "%d.%d FPS", fps_tenths / 10, fps_tenths % 10);
+	int tw = sonix_text_width(text, 2);
+	sonix_fill_rect(screen, panel_w, panel_h, 6, 6, tw + 12, 26, sonix_rgb(0, 0, 0));
+	sonix_draw_text(screen, panel_w, panel_h, 12, 12, text, sonix_rgb(150, 255, 120), 2);
+}
+
 /* A short message over the bottom of the game, for as long as it lasts. */
 static void draw_toast(void) {
 	if (toast_text && sonix_time_us() < toast_until) {
@@ -766,9 +820,13 @@ static void apply_touches(const sonix_touches_t *t) {
 	}
 	memset(dpad_active, 0, sizeof(dpad_active));
 
+	bool game_hit = false;
 	for (int i = 0; i < t->count; i++) {
 		int x = t->x[i];
 		int y = t->y[i];
+		if (y < view_h) {
+			game_hit = true;
+		}
 
 		/* the cross: a finger anywhere on it, and diagonals when it is in a corner */
 		int dx = x - dpad_cx;
@@ -810,6 +868,18 @@ static void apply_touches(const sonix_touches_t *t) {
 		}
 	}
 	pad_mask = mask;
+
+	/* a finger arriving on the picture shows or hides the frame counter */
+	static bool game_was;
+	if (game_hit && !game_was) {
+		show_fps = !show_fps;
+		fps_tenths = 0;
+		fps_frames = 0;
+		fps_stamp = 0;
+		fps_store();
+		say(show_fps ? "FPS ON" : "FPS OFF");
+	}
+	game_was = game_hit;
 
 	/* SAVE and LOAD act when the finger arrives, once. EXIT takes two taps, the first one turns the
 	 * key into SURE? for two seconds, so that a hand passing over it cannot end the game */
@@ -1042,6 +1112,7 @@ int main(int argc, char **argv) {
 
 	audio = sonix_audio_open(&env, OUT_RATE, 2);
 	sram_load();
+	fps_load();
 	fprintf(stderr, SONIX_SYSTEM ": %s, %ux%u at %.2f fps, sound %.0f Hz%s\n", rom_base, geometry.base_width,
 			geometry.base_height, core_fps, core_rate, audio ? "" : " (no sound pipe)");
 
@@ -1110,6 +1181,8 @@ int main(int argc, char **argv) {
 			last_sig = sig;
 			pad_redraw = false;
 		}
+		fps_count();
+		draw_fps();
 		draw_toast();
 		int64_t t_draw = (int64_t)sonix_time_us();
 		sonix_video_present_dirty(video);
