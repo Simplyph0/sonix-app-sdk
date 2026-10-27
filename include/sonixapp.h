@@ -78,6 +78,16 @@ uint16_t *sonix_video_frame(sonix_video_t *v);
  * page that is not on show and flips to it, so there is no tearing. */
 void sonix_video_present(sonix_video_t *v);
 
+/* Marks rows y to y + h - 1 of the frame as changed. */
+void sonix_video_dirty(sonix_video_t *v, int y, int h);
+
+/* Like present(), but writes only the rows marked since the page it draws on was last written,
+ * and flips to it. The framebuffer is slow to write -- far slower than the rest of memory -- so an
+ * app that changes one part of the screen each frame should not send the whole panel through it
+ * sixty times a second. Everything counts as changed until the first call. Do not mix it with
+ * present() for the same frame. */
+void sonix_video_present_dirty(sonix_video_t *v);
+
 void sonix_video_close(sonix_video_t *v);
 
 /* ----------------------------------------------------------------------------
@@ -239,6 +249,7 @@ struct sonix_video {
 	bool rotated;
 	bool file_mode;
 	uint16_t *frame;
+	uint8_t *dirty[2]; /* per page, per row of the page: it differs from the frame */
 	struct fb_var_screeninfo var;
 };
 
@@ -296,9 +307,18 @@ sonix_video_t *sonix_video_open(const sonix_env_t *env) {
 		}
 	}
 	v->frame = calloc((size_t)v->w * v->h, sizeof(uint16_t));
-	if (!v->frame) {
+	v->dirty[0] = malloc((size_t)v->h);
+	v->dirty[1] = malloc((size_t)v->h);
+	if (!v->frame || !v->dirty[0] || !v->dirty[1]) {
+		free(v->frame);
+		free(v->dirty[0]);
+		free(v->dirty[1]);
+		v->frame = NULL;
+		v->dirty[0] = v->dirty[1] = NULL;
 		goto fail;
 	}
+	memset(v->dirty[0], 1, (size_t)v->h);
+	memset(v->dirty[1], 1, (size_t)v->h);
 	return v;
 
 fail:
@@ -316,6 +336,56 @@ int sonix_video_width(const sonix_video_t *v) { return v->w; }
 int sonix_video_height(const sonix_video_t *v) { return v->h; }
 uint16_t *sonix_video_frame(sonix_video_t *v) { return v->frame; }
 
+/* Writes one row of the page that is not showing, turned over when the picture is. */
+static void sonix_copy_row_(sonix_video_t *v, uint8_t *page, int out_y) {
+	if (!v->rotated) {
+		memcpy(page + (size_t)out_y * v->line, v->frame + (size_t)out_y * v->w, (size_t)v->w * 2);
+	} else {
+		const uint16_t *src = v->frame + (size_t)(v->h - 1 - out_y) * v->w;
+		uint16_t *dst = (uint16_t *)(page + (size_t)out_y * v->line);
+		for (int x = 0; x < v->w; x++) {
+			dst[x] = src[v->w - 1 - x];
+		}
+	}
+}
+
+static void sonix_flip_(sonix_video_t *v, int next) {
+	if (v->file_mode) {
+		msync(v->mem, v->mem_len, MS_ASYNC);
+		return;
+	}
+	if (v->pages >= 2) {
+		v->var.yoffset = (uint32_t)next * (uint32_t)v->h;
+		v->var.activate = FB_ACTIVATE_VBL;
+		if (ioctl(v->fd, FBIOPAN_DISPLAY, &v->var) == 0) {
+			v->cur = next;
+		}
+	}
+}
+
+void sonix_video_dirty(sonix_video_t *v, int y, int h) {
+	for (int row = y; row < y + h; row++) {
+		if (row < 0 || row >= v->h) {
+			continue;
+		}
+		int out_y = v->rotated ? v->h - 1 - row : row;
+		v->dirty[0][out_y] = 1;
+		v->dirty[1][out_y] = 1;
+	}
+}
+
+void sonix_video_present_dirty(sonix_video_t *v) {
+	int next = v->pages >= 2 ? (v->cur + 1) % v->pages : 0;
+	uint8_t *page = v->mem + (size_t)next * v->h * v->line;
+	for (int y = 0; y < v->h; y++) {
+		if (v->dirty[next][y]) {
+			sonix_copy_row_(v, page, y);
+			v->dirty[next][y] = 0;
+		}
+	}
+	sonix_flip_(v, next);
+}
+
 void sonix_video_present(sonix_video_t *v) {
 	int next = v->pages >= 2 ? (v->cur + 1) % v->pages : 0;
 	uint8_t *page = v->mem + (size_t)next * v->h * v->line;
@@ -332,17 +402,10 @@ void sonix_video_present(sonix_video_t *v) {
 			}
 		}
 	}
-	if (v->file_mode) {
-		msync(v->mem, v->mem_len, MS_ASYNC);
-		return;
-	}
-	if (v->pages >= 2) {
-		v->var.yoffset = (uint32_t)next * (uint32_t)v->h;
-		v->var.activate = FB_ACTIVATE_VBL;
-		if (ioctl(v->fd, FBIOPAN_DISPLAY, &v->var) == 0) {
-			v->cur = next;
-		}
-	}
+	/* The page just written is whole; the other one may not match any more. */
+	memset(v->dirty[next], 0, (size_t)v->h);
+	memset(v->dirty[1 - (next & 1)], 1, (size_t)v->h);
+	sonix_flip_(v, next);
 }
 
 void sonix_video_close(sonix_video_t *v) {
@@ -356,6 +419,8 @@ void sonix_video_close(sonix_video_t *v) {
 		close(v->fd);
 	}
 	free(v->frame);
+	free(v->dirty[0]);
+	free(v->dirty[1]);
 	free(v);
 }
 

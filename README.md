@@ -22,6 +22,8 @@ sonix_env(&env);                                  /* where am I, how big is the 
 sonix_video_t *video = sonix_video_open(&env);    /* the framebuffer, double-buffered */
 uint16_t *frame = sonix_video_frame(video);       /* 480 x 720 (or 800) RGB565, draw here */
 sonix_video_present(video);                       /* show it, no tearing */
+sonix_video_dirty(video, y, h);                   /* or: mark the rows that changed... */
+sonix_video_present_dirty(video);                 /* ...and write only those: the framebuffer is slow */
 
 sonix_touch_t *touch = sonix_touch_open(&env);    /* up to five fingers, rotation applied */
 sonix_touches_t fingers;

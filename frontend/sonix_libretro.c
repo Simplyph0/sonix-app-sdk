@@ -21,12 +21,15 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sched.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "libretro.h"
 
@@ -61,6 +64,11 @@ static enum retro_pixel_format pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
 static struct retro_game_geometry geometry;
 static double core_fps = 60.0;
 static double core_rate = 44100.0;
+
+/* The sound always goes to the player at this rate. Cores run at whatever their machine did
+ * (48000 for the NES, 32768 for the GBA, 32040 for the SNES), and not every rate opens on the
+ * output; 44100 is the one that does everywhere. */
+#define OUT_RATE 44100
 
 /* the last frame the core gave */
 static const void *frame_data;
@@ -268,8 +276,22 @@ static bool environment_cb(unsigned cmd, void *data) {
 	case RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK:
 	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
 		return true;
-	default:
+	default: {
+		/* said once each, so that a core that needs something is found in the log */
+		static unsigned said[16];
+		static int said_count;
+		unsigned id = cmd & 0xFFFF;
+		for (int i = 0; i < said_count; i++) {
+			if (said[i] == id) {
+				return false;
+			}
+		}
+		if (said_count < 16) {
+			said[said_count++] = id;
+			fprintf(stderr, SONIX_SYSTEM ": the core asked for environment %u, not supported\n", id);
+		}
 		return false;
+	}
 	}
 }
 
@@ -310,6 +332,46 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames) {
 static void audio_sample_cb(int16_t left, int16_t right) {
 	int16_t pair[2] = {left, right};
 	audio_batch_cb(pair, 1);
+}
+
+/* Linear resampling of the core's sound to OUT_RATE. `pos` is where the next output sample falls, in
+ * input frames from the start of the chunk being read; -1 to 0 means between the last sample of
+ * the chunk before and the first of this one. */
+static double rs_pos;
+static int16_t rs_last[2];
+static int16_t *out_buf;
+static size_t out_capacity;
+
+static size_t resample(const int16_t *in, size_t n_in) {
+	if (n_in == 0) {
+		return 0;
+	}
+	double step = core_rate / (double)OUT_RATE;
+	size_t need = (size_t)((double)n_in / step) + 4;
+	if (need > out_capacity) {
+		int16_t *grown = realloc(out_buf, need * 2 * sizeof(int16_t));
+		if (!grown) {
+			return 0;
+		}
+		out_buf = grown;
+		out_capacity = need;
+	}
+	size_t n_out = 0;
+	while (rs_pos < (double)n_in - 1.0 && n_out < out_capacity) {
+		long i = (long)floor(rs_pos);
+		double frac = rs_pos - (double)i;
+		for (int c = 0; c < 2; c++) {
+			double a = i < 0 ? rs_last[c] : in[i * 2 + c];
+			double b = in[(i + 1) * 2 + c];
+			out_buf[n_out * 2 + c] = (int16_t)(a + (b - a) * frac);
+		}
+		n_out++;
+		rs_pos += step;
+	}
+	rs_pos -= (double)n_in;
+	rs_last[0] = in[(n_in - 1) * 2];
+	rs_last[1] = in[(n_in - 1) * 2 + 1];
+	return n_out;
 }
 
 static void input_poll_cb(void) {}
@@ -507,6 +569,8 @@ static bool in_button(const button_t *b, int x, int y) {
 static const uint16_t COL_BG = 0;
 static uint16_t col_idle, col_down, col_edge, col_text, col_pad;
 
+static uint64_t exit_armed_until; /* EXIT was tapped: a second tap before this leaves */
+
 static const char *toast_text;
 static uint64_t toast_until;
 
@@ -537,7 +601,10 @@ static void draw_pad(void) {
 	sonix_circle(screen, panel_w, panel_h, dpad_cx, dpad_cy, thick / 4, col_edge);
 
 	for (int i = 0; i < button_count; i++) {
-		const button_t *b = &buttons[i];
+		button_t *b = &buttons[i];
+		if (b->id == UI_EXIT) {
+			b->label = exit_armed_until > sonix_time_us() ? "SURE?" : "EXIT";
+		}
 		uint16_t fill = b->down ? col_down : col_idle;
 		int scale = 2;
 		if (b->shape == SHAPE_CIRCLE) {
@@ -554,11 +621,28 @@ static void draw_pad(void) {
 		}
 	}
 
+}
+
+/* A short message over the bottom of the game, for as long as it lasts. */
+static void draw_toast(void) {
 	if (toast_text && sonix_time_us() < toast_until) {
 		int tw = sonix_text_width(toast_text, 3);
 		sonix_fill_rect(screen, panel_w, panel_h, (panel_w - tw) / 2 - 10, view_h - 40, tw + 20, 34, sonix_rgb(0, 0, 0));
 		sonix_draw_text(screen, panel_w, panel_h, (panel_w - tw) / 2, view_h - 33, toast_text, sonix_rgb(255, 255, 255), 3);
 	}
+}
+
+/* What the pad looks like, as one number: it is redrawn only when this changes. */
+static uint32_t pad_signature(void) {
+	uint32_t sig = 2166136261u;
+	for (int i = 0; i < button_count; i++) {
+		sig = (sig ^ (uint32_t)(buttons[i].down ? 1 : 0)) * 16777619u;
+	}
+	for (int i = 0; i < 4; i++) {
+		sig = (sig ^ (uint32_t)(dpad_active[i] ? 1 : 0)) * 16777619u;
+	}
+	sig = (sig ^ (exit_armed_until > sonix_time_us() ? 1u : 0u)) * 16777619u;
+	return sig;
 }
 
 static void say(const char *text) {
@@ -668,7 +752,7 @@ static void state_load(void) {
  * Touch to buttons
  * ------------------------------------------------------------------------- */
 
-static uint64_t exit_since; /* when a finger first rested on EXIT, 0 if none */
+static bool exit_was_down;
 
 static void apply_touches(const sonix_touches_t *t) {
 	uint32_t mask = 0;
@@ -725,8 +809,8 @@ static void apply_touches(const sonix_touches_t *t) {
 	}
 	pad_mask = mask;
 
-	/* SAVE and LOAD act when the finger arrives, once; EXIT after a short hold, so
-	 * that a hand passing over it cannot end the game */
+	/* SAVE and LOAD act when the finger arrives, once. EXIT takes two taps, the first one turns the
+	 * key into SURE? for two seconds, so that a hand passing over it cannot end the game */
 	static bool save_was, load_was;
 	if (save_hit && !save_was) {
 		state_save();
@@ -736,15 +820,15 @@ static void apply_touches(const sonix_touches_t *t) {
 	}
 	save_was = save_hit;
 	load_was = load_hit;
-	if (exit_hit) {
-		if (!exit_since) {
-			exit_since = sonix_time_us();
-		} else if (sonix_time_us() - exit_since > 350000) {
+	if (exit_hit && !exit_was_down) {
+		uint64_t now = sonix_time_us();
+		if (exit_armed_until > now) {
 			quit_requested = 1;
+		} else {
+			exit_armed_until = now + 2000000;
 		}
-	} else {
-		exit_since = 0;
 	}
+	exit_was_down = exit_hit;
 }
 
 /* ---------------------------------------------------------------------------
@@ -754,6 +838,16 @@ static void apply_touches(const sonix_touches_t *t) {
 static void on_signal(int sig) {
 	(void)sig;
 	quit_requested = 1;
+}
+
+/* A crash leaves a line in the log and ends the program with the usual 128 + signal, so that
+ * whatever started it (the player, or a script that tries something else) can tell. */
+static void on_crash(int sig) {
+	static const char msg[] = SONIX_SYSTEM ": crashed\n";
+	if (write(2, msg, sizeof(msg) - 1) < 0) {
+		/* nothing to do about it */
+	}
+	_exit(128 + sig);
 }
 
 static uint8_t *read_all(const char *path, size_t *size) {
@@ -784,11 +878,27 @@ static void set_base_name(const char *path) {
 }
 
 int main(int argc, char **argv) {
+	setvbuf(stderr, NULL, _IONBF, 0);
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGSEGV, on_crash);
+	signal(SIGBUS, on_crash);
+	signal(SIGILL, on_crash);
+	signal(SIGFPE, on_crash);
+	signal(SIGABRT, on_crash);
 
 	sonix_env(&env);
+	if (env.under_player) {
+		/* The emulator runs a little ahead of ordinary threads: a frame that is late is a gap in
+		 * the sound. It sleeps or blocks every frame, so it cannot starve anything. */
+		struct sched_param rt;
+		memset(&rt, 0, sizeof(rt));
+		rt.sched_priority = 5;
+		if (sched_setscheduler(0, SCHED_RR, &rt) != 0) {
+			fprintf(stderr, SONIX_SYSTEM ": runs at normal priority\n");
+		}
+	}
 	if (getenv("SONIX_TEST_FRAMES")) {
 		test_frames = atol(getenv("SONIX_TEST_FRAMES"));
 	}
@@ -880,7 +990,7 @@ int main(int argc, char **argv) {
 	core_rate = av.timing.sample_rate > 1000 ? av.timing.sample_rate : 44100.0;
 	retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
 
-	audio = sonix_audio_open(&env, (int)(core_rate + 0.5), 2);
+	audio = sonix_audio_open(&env, OUT_RATE, 2);
 	sram_load();
 	fprintf(stderr, SONIX_SYSTEM ": %s, %ux%u at %.2f fps, sound %.0f Hz%s\n", rom_base, geometry.base_width,
 			geometry.base_height, core_fps, core_rate, audio ? "" : " (no sound pipe)");
@@ -889,6 +999,7 @@ int main(int argc, char **argv) {
 	build_pad();
 	sonix_fill_rect(screen, panel_w, panel_h, 0, 0, panel_w, panel_h, COL_BG);
 	draw_pad();
+	fprintf(stderr, SONIX_SYSTEM ": running, sound %s\n", audio ? "through the player" : "off");
 
 	uint64_t frame_us = (uint64_t)(1000000.0 / core_fps);
 	uint64_t next = sonix_time_us();
@@ -897,6 +1008,12 @@ int main(int argc, char **argv) {
 	memset(&fingers, 0, sizeof(fingers));
 	unsigned last_w = 0;
 	unsigned last_h = 0;
+	uint32_t last_sig = 0;
+	bool pad_redraw = true;
+	/* how long each part of a frame takes, for the log: sum and longest, in microseconds */
+	int64_t st_sum[4] = {0, 0, 0, 0};
+	int64_t st_max[4] = {0, 0, 0, 0};
+	int st_frames = 0;
 
 	long frames_run = 0;
 	while (!quit_requested) {
@@ -904,11 +1021,18 @@ int main(int argc, char **argv) {
 			sonix_touch_read(touch, &fingers);
 		}
 		if (have_test_touch) {
+			/* SONIX_TEST_BLINK=1 lifts the fingers for 20 frames out of every 30, so that a test
+			 * can tap */
+			bool lifted = getenv("SONIX_TEST_BLINK") && (frames_run % 30) >= 10;
 			fingers = test_touch;
+			if (lifted) {
+				fingers.count = 0;
+			}
 		}
 		apply_touches(&fingers);
 
 		audio_frames = 0;
+		int64_t t_start = (int64_t)sonix_time_us();
 		retro_run();
 
 		if (frame_w != last_w || frame_h != last_h) {
@@ -923,26 +1047,65 @@ int main(int argc, char **argv) {
 			compute_view();
 			build_pad();
 			sonix_fill_rect(screen, panel_w, panel_h, 0, 0, panel_w, panel_h, COL_BG);
+			sonix_video_dirty(video, 0, panel_h);
+			pad_redraw = true;
 		}
+		int64_t t_run = (int64_t)sonix_time_us();
 		draw_game();
-		draw_pad();
-		sonix_video_present(video);
+		sonix_video_dirty(video, 0, view_h);
+		uint32_t sig = pad_signature();
+		if (sig != last_sig || pad_redraw) {
+			draw_pad();
+			sonix_video_dirty(video, view_h + 6, panel_h - view_h - 6);
+			last_sig = sig;
+			pad_redraw = false;
+		}
+		draw_toast();
+		int64_t t_draw = (int64_t)sonix_time_us();
+		sonix_video_present_dirty(video);
+		int64_t t_present = (int64_t)sonix_time_us();
 
+		int64_t t_audio = (int64_t)sonix_time_us();
 		if (audio && audio_frames > 0) {
-			if (!sonix_audio_write(audio, audio_buf, (int)audio_frames)) {
+			size_t n = resample(audio_buf, audio_frames);
+			if (n > 0 && !sonix_audio_write(audio, out_buf, (int)n)) {
 				break; /* the player has gone */
 			}
-		} else {
-			next += frame_us;
-			uint64_t now = sonix_time_us();
-			if (next > now) {
-				sonix_sleep_us(next - now);
-			} else if (now - next > 200000) {
-				next = now; /* long behind: do not run flat out to catch up */
+		}
+		int64_t t_wrote = (int64_t)sonix_time_us();
+
+		/* every 600 frames the log says where the time went: the core, the picture, the
+		 * framebuffer, and the wait on the sound (which is the sound card setting the pace) */
+		int64_t parts[4] = {t_run - t_start, t_draw - t_run, t_present - t_draw, t_wrote - t_audio};
+		for (int i = 0; i < 4; i++) {
+			st_sum[i] += parts[i];
+			if (parts[i] > st_max[i]) {
+				st_max[i] = parts[i];
 			}
 		}
+		if (++st_frames == 600) {
+			fprintf(stderr,
+					SONIX_SYSTEM ": 600 frames, ms average/longest: core %.1f/%.1f, picture %.1f/%.1f, "
+								 "framebuffer %.1f/%.1f, sound wait %.1f/%.1f\n",
+					st_sum[0] / 600000.0, st_max[0] / 1000.0, st_sum[1] / 600000.0, st_max[1] / 1000.0,
+					st_sum[2] / 600000.0, st_max[2] / 1000.0, st_sum[3] / 600000.0, st_max[3] / 1000.0);
+			memset(st_sum, 0, sizeof(st_sum));
+			memset(st_max, 0, sizeof(st_max));
+			st_frames = 0;
+		}
+		/* Paced by the clock as well as by the sound: the sound card slows the loop to the right
+		 * speed, and when the player could not open the output (or the core makes no sound) the
+		 * clock does it instead of the game running flat out. */
+		next += frame_us;
+		uint64_t paced = sonix_time_us();
+		if (next > paced) {
+			sonix_sleep_us(next - paced);
+		} else if (paced - next > 200000) {
+			next = paced; /* long behind: do not run flat out to catch up */
+		}
 
-		if (test_frames && ++frames_run >= test_frames) {
+		frames_run++;
+		if (test_frames && frames_run >= test_frames) {
 			break;
 		}
 

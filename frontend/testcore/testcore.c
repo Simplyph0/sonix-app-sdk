@@ -16,7 +16,7 @@
 
 #define W 256
 #define H 224
-#define RATE 44100
+#define DEFAULT_RATE 44100
 #define FPS 60
 
 static retro_environment_t environ_cb;
@@ -29,6 +29,12 @@ static uint16_t frame[W * H];
 static uint32_t frames;
 static float phase;
 static uint8_t save_ram[64];
+
+/* TESTCORE_RATE=32768 makes the core run its sound at another rate, as the real ones do */
+static int rate_now(void) {
+	const char *r = getenv("TESTCORE_RATE");
+	return r && atoi(r) > 8000 ? atoi(r) : DEFAULT_RATE;
+}
 
 void retro_set_environment(retro_environment_t cb) { environ_cb = cb; }
 void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -62,7 +68,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info) {
 	info->geometry.max_height = H;
 	info->geometry.aspect_ratio = 4.0f / 3.0f;
 	info->timing.fps = FPS;
-	info->timing.sample_rate = RATE;
+	info->timing.sample_rate = rate_now();
 }
 
 bool retro_load_game(const struct retro_game_info *game) {
@@ -129,7 +135,8 @@ void retro_run(void) {
 	video_cb(frame, W, H, W * sizeof(uint16_t));
 
 	/* a tone while A or B is held: 440 Hz for A, 660 Hz for B */
-	int16_t sound[(RATE / FPS + 1) * 2];
+	int RATE = rate_now();
+	int16_t sound[(48000 / FPS + 1) * 2];
 	int n = RATE / FPS;
 	float freq = (held & (1u << RETRO_DEVICE_ID_JOYPAD_A)) ? 440.0f : (held & (1u << RETRO_DEVICE_ID_JOYPAD_B)) ? 660.0f : 0.0f;
 	for (int i = 0; i < n; i++) {
