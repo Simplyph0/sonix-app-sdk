@@ -21,12 +21,14 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -850,22 +852,56 @@ static void on_crash(int sig) {
 	_exit(128 + sig);
 }
 
-static uint8_t *read_all(const char *path, size_t *size) {
-	FILE *f = fopen(path, "rb");
-	if (!f) {
+/* The game file as the core is given it. It is mapped, not read: a 16 MB game read into memory and
+ * then copied by the core takes 32 MB of a player that has 58, and the mapping is file pages that
+ * the system can let go of. `*mapped` says it has to be unmapped, not freed. */
+static uint8_t *read_all(const char *path, size_t *size, bool *mapped) {
+	*mapped = false;
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
 		return NULL;
 	}
-	fseek(f, 0, SEEK_END);
-	long n = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	uint8_t *data = n > 0 ? malloc((size_t)n) : NULL;
-	if (data && fread(data, 1, (size_t)n, f) != (size_t)n) {
+	off_t n = lseek(fd, 0, SEEK_END);
+	if (n <= 0) {
+		close(fd);
+		return NULL;
+	}
+	*size = (size_t)n;
+	void *m = mmap(NULL, (size_t)n, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (m != MAP_FAILED) {
+		close(fd);
+		*mapped = true;
+		return m;
+	}
+	uint8_t *data = malloc((size_t)n);
+	if (data && (lseek(fd, 0, SEEK_SET) != 0 || read(fd, data, (size_t)n) != n)) {
 		free(data);
 		data = NULL;
 	}
-	fclose(f);
-	*size = (size_t)n;
+	close(fd);
 	return data;
+}
+
+/* What the system has left, for the log: this is what decides whether a big game starts. */
+static void log_memory(const char *when) {
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f) {
+		return;
+	}
+	char line[96];
+	long total = 0;
+	long avail = 0;
+	long cached = 0;
+	long swap_free = 0;
+	while (fgets(line, sizeof(line), f)) {
+		sscanf(line, "MemTotal: %ld", &total);
+		sscanf(line, "MemAvailable: %ld", &avail);
+		sscanf(line, "Cached: %ld", &cached);
+		sscanf(line, "SwapFree: %ld", &swap_free);
+	}
+	fclose(f);
+	fprintf(stderr, SONIX_SYSTEM ": memory %s: %ld of %ld kB available, %ld kB cached, %ld kB swap free\n", when, avail,
+			total, cached, swap_free);
 }
 
 static void set_base_name(const char *path) {
@@ -967,9 +1003,13 @@ int main(int argc, char **argv) {
 	memset(&game, 0, sizeof(game));
 	game.path = rom_path;
 	uint8_t *rom_data = NULL;
+	bool rom_mapped = false;
+	size_t rom_size = 0;
+	log_memory("at the start");
 	if (!info.need_fullpath) {
 		size_t size;
-		rom_data = read_all(rom_path, &size);
+		rom_data = read_all(rom_path, &size, &rom_mapped);
+		rom_size = size;
 		if (!rom_data) {
 			fprintf(stderr, SONIX_SYSTEM ": cannot read %s\n", rom_path);
 			return 1;
@@ -981,6 +1021,16 @@ int main(int argc, char **argv) {
 		fprintf(stderr, SONIX_SYSTEM ": the core does not take %s\n", rom_path);
 		return 1;
 	}
+	/* The core has its own copy by now: the game file is no longer needed in memory. */
+	if (rom_data) {
+		if (rom_mapped) {
+			munmap(rom_data, rom_size);
+		} else {
+			free(rom_data);
+		}
+		rom_data = NULL;
+	}
+	log_memory("with the game loaded");
 
 	struct retro_system_av_info av;
 	memset(&av, 0, sizeof(av));
@@ -1119,7 +1169,6 @@ int main(int argc, char **argv) {
 	sram_save(true);
 	retro_unload_game();
 	retro_deinit();
-	free(rom_data);
 	sonix_audio_close(audio);
 	sonix_touch_close(touch);
 	sonix_video_close(video);
