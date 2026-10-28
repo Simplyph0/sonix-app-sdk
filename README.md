@@ -47,8 +47,8 @@ with `--frames 3`.
 `sonix_libretro.c` plays any [libretro](https://www.libretro.com/) core that is linked into it:
 the game on the top of the screen, an on-screen pad below (D-pad, A B, shoulders where the system
 has them, Select and Start, and SAVE, LOAD and EXIT keys), sound through the player, battery saves
-in `<card>/Saves/<system>/` and one save state per game. EXIT takes two taps; a tap on the picture shows or
-hides an FPS counter (kept as `Saves/<system>/.fps`). An emulator app is this file, a core and
+in `<card>/Saves/<system>/` and one save state per game. EXIT takes two taps; MENU opens the options (FPS
+counter, sound on or off, frame skip), kept in `Saves/<system>/.options`. An emulator app is this file, a core and
 two defines:
 
 ```

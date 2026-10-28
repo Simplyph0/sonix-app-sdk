@@ -468,6 +468,7 @@ static void draw_game(void) {
 #define UI_EXIT 100
 #define UI_SAVE 101
 #define UI_LOAD 102
+#define UI_MENU 103
 
 typedef enum {
 	SHAPE_RECT,
@@ -510,12 +511,13 @@ static void build_pad(void) {
 	int top = view_h + 6;
 	int bar_h = 44;
 
-	/* the bar between the picture and the pad: SAVE, LOAD, EXIT */
-	int bw = 120;
-	int gap = (panel_w - 3 * bw) / 4;
+	/* the bar between the picture and the pad: SAVE, LOAD, MENU, EXIT */
+	int bw = 100;
+	int gap = (panel_w - 4 * bw) / 5;
 	add_button(UI_SAVE, SHAPE_ROUND, gap, top, bw, bar_h, "SAVE");
 	add_button(UI_LOAD, SHAPE_ROUND, gap * 2 + bw, top, bw, bar_h, "LOAD");
-	add_button(UI_EXIT, SHAPE_ROUND, gap * 3 + bw * 2, top, bw, bar_h, "EXIT");
+	add_button(UI_MENU, SHAPE_ROUND, gap * 3 + bw * 2, top, bw, bar_h, "MENU");
+	add_button(UI_EXIT, SHAPE_ROUND, gap * 4 + bw * 3, top, bw, bar_h, "EXIT");
 
 	int pad_top = top + bar_h + 8;
 	int pad_h = panel_h - pad_top - 8;
@@ -625,33 +627,54 @@ static void draw_pad(void) {
 
 }
 
-/* The frame counter: tap the picture to show it or hide it. It is kept as a file in the saves
- * folder (Saves/<system>/.fps), so it stays as it was left. */
+/* The options menu (the MENU key): the frame counter, the sound and how many pictures are skipped.
+ * They are kept in a file in the saves folder (Saves/<system>/.options), so they stay as they were
+ * left. The game is paused while the menu is up. */
 static bool show_fps;
+static bool sound_on = true;
+static int frame_skip; /* pictures not drawn between two that are: 0, 1 or 2 */
+static bool menu_open;
+static bool menu_dirty;
 static int fps_tenths; /* frames per second, times ten */
 static int fps_frames;
 static uint64_t fps_stamp;
 
-static void fps_path(char *out, size_t size) { snprintf(out, size, "%s/.fps", save_dir); }
+static void options_path(char *out, size_t size, const char *name) { snprintf(out, size, "%s/%s", save_dir, name); }
 
-static void fps_load(void) {
+static void options_load(void) {
 	char path[640];
-	fps_path(path, sizeof(path));
+	/* the counter was a file of its own in the first version of the apps */
+	options_path(path, sizeof(path), ".fps");
 	show_fps = access(path, F_OK) == 0;
+	options_path(path, sizeof(path), ".options");
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return;
+	}
+	char line[64];
+	while (fgets(line, sizeof(line), f)) {
+		int v;
+		if (sscanf(line, "fps=%d", &v) == 1) {
+			show_fps = v != 0;
+		} else if (sscanf(line, "sound=%d", &v) == 1) {
+			sound_on = v != 0;
+		} else if (sscanf(line, "skip=%d", &v) == 1) {
+			frame_skip = v < 0 ? 0 : v > 2 ? 2 : v;
+		}
+	}
+	fclose(f);
 }
 
-static void fps_store(void) {
+static void options_store(void) {
 	char path[640];
-	fps_path(path, sizeof(path));
-	if (show_fps) {
-		FILE *f = fopen(path, "w");
-		if (f) {
-			fputs("shown\n", f);
-			fclose(f);
-		}
-	} else {
-		remove(path);
+	options_path(path, sizeof(path), ".options");
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "fps=%d%ssound=%d%sskip=%d%s", show_fps, "\n", sound_on, "\n", frame_skip, "\n");
+		fclose(f);
 	}
+	options_path(path, sizeof(path), ".fps");
+	remove(path); /* it is in the options file now */
 }
 
 /* Counts a frame, and every thirty works out what they came to in the time they took. */
@@ -686,6 +709,86 @@ static void draw_toast(void) {
 		sonix_fill_rect(screen, panel_w, panel_h, (panel_w - tw) / 2 - 10, view_h - 40, tw + 20, 34, sonix_rgb(0, 0, 0));
 		sonix_draw_text(screen, panel_w, panel_h, (panel_w - tw) / 2, view_h - 33, toast_text, sonix_rgb(255, 255, 255), 3);
 	}
+}
+
+/* The options, over the picture. Three rows and a key to go back; a tap on a row changes it. */
+#define MENU_ROWS 3
+
+static void menu_geometry(int *first_y, int *row_h, int *resume_y, int *resume_h) {
+	*resume_h = 52;
+	*first_y = 56;
+	int room = view_h - *first_y - *resume_h - 20;
+	*row_h = room / MENU_ROWS;
+	if (*row_h > 60) {
+		*row_h = 60;
+	}
+	*resume_y = *first_y + *row_h * MENU_ROWS + 12;
+}
+
+static const char *menu_value(int row) {
+	static const char *const skips[3] = {"OFF", "1", "2"};
+	switch (row) {
+	case 0:
+		return show_fps ? "ON" : "OFF";
+	case 1:
+		return sound_on ? "ON" : "OFF";
+	default:
+		return skips[frame_skip];
+	}
+}
+
+static void draw_menu(void) {
+	static const char *const names[MENU_ROWS] = {"FPS COUNTER", "SOUND", "FRAME SKIP"};
+	int first_y, row_h, resume_y, resume_h;
+	menu_geometry(&first_y, &row_h, &resume_y, &resume_h);
+	sonix_fill_rect(screen, panel_w, panel_h, 0, 0, panel_w, view_h, sonix_rgb(14, 18, 28));
+	sonix_draw_text(screen, panel_w, panel_h, (panel_w - sonix_text_width("OPTIONS", 3)) / 2, 18, "OPTIONS",
+					sonix_rgb(255, 255, 255), 3);
+	for (int i = 0; i < MENU_ROWS; i++) {
+		int y = first_y + i * row_h;
+		sonix_round_rect(screen, panel_w, panel_h, 16, y + 3, panel_w - 32, row_h - 6, (row_h - 6) / 2, col_idle);
+		sonix_draw_text(screen, panel_w, panel_h, 36, y + (row_h - 14) / 2, names[i], col_text, 2);
+		const char *v = menu_value(i);
+		int pw = 96;
+		int px = panel_w - 16 - 10 - pw;
+		bool on = !(strcmp(v, "OFF") == 0);
+		sonix_round_rect(screen, panel_w, panel_h, px, y + 9, pw, row_h - 18, (row_h - 18) / 2,
+						 on ? sonix_rgb(40, 110, 220) : col_pad);
+		sonix_draw_text(screen, panel_w, panel_h, px + (pw - sonix_text_width(v, 2)) / 2, y + (row_h - 14) / 2, v,
+						col_text, 2);
+	}
+	sonix_round_rect(screen, panel_w, panel_h, 16, resume_y, panel_w - 32, resume_h, resume_h / 2, sonix_rgb(40, 110, 220));
+	sonix_draw_text(screen, panel_w, panel_h, (panel_w - sonix_text_width("RESUME", 3)) / 2, resume_y + (resume_h - 21) / 2,
+					"RESUME", sonix_rgb(255, 255, 255), 3);
+}
+
+/* A finger arrived on the menu at x,y. */
+static void menu_tap(int y) {
+	int first_y, row_h, resume_y, resume_h;
+	menu_geometry(&first_y, &row_h, &resume_y, &resume_h);
+	if (y >= resume_y - 6 && y < resume_y + resume_h + 6) {
+		menu_open = false;
+		options_store();
+	} else if (y >= first_y && y < first_y + row_h * MENU_ROWS) {
+		switch ((y - first_y) / row_h) {
+		case 0:
+			show_fps = !show_fps;
+			fps_tenths = 0;
+			fps_frames = 0;
+			fps_stamp = 0;
+			break;
+		case 1:
+			sound_on = !sound_on;
+			break;
+		default:
+			frame_skip = (frame_skip + 1) % 3;
+			break;
+		}
+		options_store();
+	} else {
+		return;
+	}
+	menu_dirty = true;
 }
 
 /* What the pad looks like, as one number: it is redrawn only when this changes. */
@@ -815,18 +918,15 @@ static void apply_touches(const sonix_touches_t *t) {
 	bool save_hit = false;
 	bool load_hit = false;
 	bool exit_hit = false;
+	bool menu_hit = false;
 	for (int i = 0; i < button_count; i++) {
 		buttons[i].down = false;
 	}
 	memset(dpad_active, 0, sizeof(dpad_active));
 
-	bool game_hit = false;
 	for (int i = 0; i < t->count; i++) {
 		int x = t->x[i];
 		int y = t->y[i];
-		if (y < view_h) {
-			game_hit = true;
-		}
 
 		/* the cross: a finger anywhere on it, and diagonals when it is in a corner */
 		int dx = x - dpad_cx;
@@ -862,6 +962,8 @@ static void apply_touches(const sonix_touches_t *t) {
 				load_hit = true;
 			} else if (buttons[b].id == UI_EXIT) {
 				exit_hit = true;
+			} else if (buttons[b].id == UI_MENU) {
+				menu_hit = true;
 			} else {
 				mask |= 1u << buttons[b].id;
 			}
@@ -869,17 +971,33 @@ static void apply_touches(const sonix_touches_t *t) {
 	}
 	pad_mask = mask;
 
-	/* a finger arriving on the picture shows or hides the frame counter */
-	static bool game_was;
-	if (game_hit && !game_was) {
-		show_fps = !show_fps;
-		fps_tenths = 0;
-		fps_frames = 0;
-		fps_stamp = 0;
-		fps_store();
-		say(show_fps ? "FPS ON" : "FPS OFF");
+	/* MENU opens the options and, while they are up, closes them */
+	static bool menu_was;
+	if (menu_hit && !menu_was) {
+		menu_open = !menu_open;
+		menu_dirty = true;
+		if (!menu_open) {
+			options_store();
+		}
 	}
-	game_was = game_hit;
+	menu_was = menu_hit;
+	if (menu_open) {
+		pad_mask = 0;
+		memset(dpad_active, 0, sizeof(dpad_active));
+		static bool menu_finger_was;
+		bool menu_finger = false;
+		int menu_y = 0;
+		for (int i = 0; i < t->count; i++) {
+			if (t->y[i] < view_h) {
+				menu_finger = true;
+				menu_y = t->y[i];
+			}
+		}
+		if (menu_finger && !menu_finger_was) {
+			menu_tap(menu_y);
+		}
+		menu_finger_was = menu_finger;
+	}
 
 	/* SAVE and LOAD act when the finger arrives, once. EXIT takes two taps, the first one turns the
 	 * key into SURE? for two seconds, so that a hand passing over it cannot end the game */
@@ -1008,6 +1126,9 @@ int main(int argc, char **argv) {
 	if (getenv("SONIX_TEST_FRAMES")) {
 		test_frames = atol(getenv("SONIX_TEST_FRAMES"));
 	}
+	if (getenv("SONIX_TEST_MENU")) {
+		menu_open = true; /* the options, up from the start */
+	}
 	if (getenv("SONIX_TEST_TOUCH")) {
 		have_test_touch = true;
 		const char *p = getenv("SONIX_TEST_TOUCH");
@@ -1112,7 +1233,7 @@ int main(int argc, char **argv) {
 
 	audio = sonix_audio_open(&env, OUT_RATE, 2);
 	sram_load();
-	fps_load();
+	options_load();
 	fprintf(stderr, SONIX_SYSTEM ": %s, %ux%u at %.2f fps, sound %.0f Hz%s\n", rom_base, geometry.base_width,
 			geometry.base_height, core_fps, core_rate, audio ? "" : " (no sound pipe)");
 
@@ -1131,6 +1252,7 @@ int main(int argc, char **argv) {
 	unsigned last_h = 0;
 	uint32_t last_sig = 0;
 	bool pad_redraw = true;
+	bool menu_was_open = false;
 	/* how long each part of a frame takes, for the log: sum and longest, in microseconds */
 	int64_t st_sum[4] = {0, 0, 0, 0};
 	int64_t st_max[4] = {0, 0, 0, 0};
@@ -1154,6 +1276,53 @@ int main(int argc, char **argv) {
 
 		audio_frames = 0;
 		int64_t t_start = (int64_t)sonix_time_us();
+		bool was_open = menu_was_open;
+		menu_was_open = menu_open;
+		if (menu_open) {
+			/* paused: the menu is drawn when it changes, and the sound card is fed silence so that
+			 * it does not click and the loop keeps its pace */
+			if (menu_dirty || !was_open) {
+				draw_menu();
+				sonix_video_dirty(video, 0, view_h);
+				menu_dirty = false;
+			}
+			uint32_t sig = pad_signature();
+			if (sig != last_sig || pad_redraw) {
+				draw_pad();
+				sonix_video_dirty(video, view_h + 6, panel_h - view_h - 6);
+				last_sig = sig;
+				pad_redraw = false;
+			}
+			sonix_video_present_dirty(video);
+			if (audio) {
+				size_t quiet = (size_t)((double)OUT_RATE / core_fps);
+				static int16_t silence[2 * 2048];
+				if (quiet > 2048) {
+					quiet = 2048;
+				}
+				if (!sonix_audio_write(audio, silence, (int)quiet)) {
+					break;
+				}
+			}
+			next += frame_us;
+			uint64_t paced_now = sonix_time_us();
+			if (next > paced_now) {
+				sonix_sleep_us(next - paced_now);
+			} else if (paced_now - next > 200000) {
+				next = paced_now;
+			}
+			frames_run++;
+			if (test_frames && frames_run >= test_frames) {
+				break;
+			}
+			continue;
+		}
+		if (was_open) {
+			/* the game is back: all of it is drawn again */
+			pad_redraw = true;
+			sonix_fill_rect(screen, panel_w, panel_h, 0, 0, panel_w, panel_h, COL_BG);
+			sonix_video_dirty(video, 0, panel_h);
+		}
 		retro_run();
 
 		if (frame_w != last_w || frame_h != last_h) {
@@ -1172,8 +1341,10 @@ int main(int argc, char **argv) {
 			pad_redraw = true;
 		}
 		int64_t t_run = (int64_t)sonix_time_us();
-		draw_game();
-		sonix_video_dirty(video, 0, view_h);
+		if (frame_skip == 0 || frames_run % (frame_skip + 1) == 0) {
+			draw_game();
+			sonix_video_dirty(video, 0, view_h);
+		}
 		uint32_t sig = pad_signature();
 		if (sig != last_sig || pad_redraw) {
 			draw_pad();
@@ -1191,6 +1362,9 @@ int main(int argc, char **argv) {
 		int64_t t_audio = (int64_t)sonix_time_us();
 		if (audio && audio_frames > 0) {
 			size_t n = resample(audio_buf, audio_frames);
+			if (!sound_on) {
+				memset(out_buf, 0, n * 2 * sizeof(int16_t)); /* muted, but the card still sets the pace */
+			}
 			if (n > 0 && !sonix_audio_write(audio, out_buf, (int)n)) {
 				break; /* the player has gone */
 			}
